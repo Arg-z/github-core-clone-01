@@ -76,9 +76,28 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+/** Gracefully stop the HTTP server and terminate the process. */
+function shutdownServer(server: ReturnType<typeof createApp>, exitCode: number): void {
+  try {
+    server.close();
+  } catch {
+    // Ignore close errors during shutdown.
+  }
+  process.exit(exitCode);
+}
+
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
+  let shuttingDown = false;
+  const onSignal = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    shutdownServer(server, 0);
+  };
+  process.once('SIGTERM', onSignal);
+  process.once('SIGINT', onSignal);
+
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
@@ -91,6 +110,8 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
+  process.removeListener('SIGTERM', onSignal);
+  process.removeListener('SIGINT', onSignal);
   server.close();
   process.stdout.write('[entry] done\n');
 }
