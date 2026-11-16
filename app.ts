@@ -1,49 +1,130 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
-
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGitHttp } from './git-http.ts';
+import { handleGraphql } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { getIssueJsonBuf, handleRest, sendJson } from './rest.ts';
+import { ForgeStore } from './store.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  const clHeader = req.headers['content-length'];
+  const cl = clHeader !== undefined ? parseInt(Array.isArray(clHeader) ? clHeader[0]! : clHeader, 10) : -1;
+  if (Number.isFinite(cl) && cl === 0) return Promise.resolve(Buffer.alloc(0));
+  return new Promise((resolve, reject) => {
+    if (Number.isFinite(cl) && cl > 0 && cl <= 16 * 1024 * 1024) {
+      const buf = Buffer.allocUnsafe(cl);
+      let off = 0;
+      let extra: Buffer[] | null = null;
+      req.on('data', (chunk: Buffer) => {
+        if (extra === null && off + chunk.length <= cl) {
+          chunk.copy(buf, off);
+          off += chunk.length;
+        } else {
+          if (extra === null) extra = off > 0 ? [buf.subarray(0, off), chunk] : [chunk];
+          else extra.push(chunk);
+        }
+      });
+      req.on('end', () => {
+        if (extra !== null) resolve(Buffer.concat(extra));
+        else resolve(off === cl ? buf : buf.subarray(0, off));
+      });
+      req.on('error', reject);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+function parseUrl(req: IncomingMessage): URL {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
   } catch {
-    return '/';
+    return new URL('/', 'http://127.0.0.1');
   }
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+function dispatch(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: ForgeStore,
+  url: URL,
+  body: Buffer,
+  reqId: string,
+): void {
+  try {
+    if (handleGitHttp(req, res, store, url, body, reqId)) return;
+    if (handleGraphql(req, res, store, url, body, reqId)) return;
+    if (handleMcp(req, res, store, url, body, reqId)) return;
+    if (handleRest(req, res, store, url, body, reqId)) return;
+    sendJson(res, 404, { message: 'Not Found' }, { 'x-github-request-id': reqId });
+  } catch (err) {
+    sendJson(
+      res,
+      500,
+      { message: err instanceof Error ? err.message : 'Internal Server Error' },
+      { 'x-github-request-id': reqId },
+    );
+  }
+}
+
+const FAST_ISSUE_GET = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
+
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+  const store = new ForgeStore();
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const reqId = store.nextRequestId();
+    const rawUrl = req.url ?? '/';
+
+    if (req.method === 'GET') {
+      if (rawUrl === '/healthz') {
+        sendJson(res, 200, { ok: true }, { 'x-github-request-id': reqId });
+        return;
+      }
+      const m = FAST_ISSUE_GET.exec(rawUrl);
+      if (m && store.isAuthorized(req.headers.authorization)) {
+        const repo = store.resolveRepo(decodeURIComponent(m[1]!), decodeURIComponent(m[2]!));
+        const issue = repo?.issueByNumber.get(parseInt(m[3]!, 10));
+        if (issue) {
+          const buf = getIssueJsonBuf(issue);
+          res.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': buf.length,
+            'x-github-request-id': reqId,
+          });
+          res.end(buf);
+          return;
+        }
+      }
+    }
+
+    const url = parseUrl(req);
+    const hasBody =
+      req.method !== 'GET' &&
+      req.method !== 'HEAD' &&
+      (req.method !== 'DELETE' || (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0'));
+
+    if (!hasBody) {
+      dispatch(req, res, store, url, Buffer.alloc(0), reqId);
       return;
     }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+    readBody(req).then(
+      (body) => dispatch(req, res, store, url, body, reqId),
+      (err) => {
+        sendJson(
+          res,
+          500,
+          { message: err instanceof Error ? err.message : 'Internal Server Error' },
+          { 'x-github-request-id': reqId },
+        );
+      },
+    );
   });
+
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
+  return server;
 }
