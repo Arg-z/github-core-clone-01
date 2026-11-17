@@ -16,7 +16,7 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
-import { createApp } from './app.ts';
+import { createApp, warmupForge } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -88,6 +88,7 @@ function shutdownServer(server: ReturnType<typeof createApp>, exitCode: number):
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
+  warmupForge();
   const server = createApp();
   let shuttingDown = false;
   const onSignal = (): void => {

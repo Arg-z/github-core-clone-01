@@ -7,6 +7,7 @@ export interface GitObject {
   type: GitObjType;
   data: Buffer;
   deflated?: Buffer;
+  parent0?: string | null;
 }
 
 export interface TreeEntry {
@@ -49,7 +50,8 @@ export interface Issue {
   created_at: string;
   updated_at: string;
   closed_at: string | null;
-  cachedJsonBuf?: Buffer;
+  cachedJsonBuf?: Buffer | null;
+  cachedHttpBuf?: Buffer | null;
 }
 
 export interface PullRequest {
@@ -68,6 +70,11 @@ export interface PullRequest {
   user: { login: string };
   created_at: string;
   updated_at: string;
+}
+
+export interface CachedUploadHttpEntry {
+  reqBody: Buffer;
+  respHttp: Buffer;
 }
 
 export interface Repository {
@@ -90,19 +97,71 @@ export interface Repository {
   treeCache: Map<string, Map<string, { mode: string; sha: string }>>;
   // Cached upload-pack v2 shallow fetch payloads keyed by "want:deepen"
   fetchCache: Map<string, Buffer>;
+  // Versioning and pre-built HTTP response caches
+  deleted: boolean;
+  refsVersion: number;
+  cachedReceivePackAdHttp: Buffer | null;
+  cachedRepoJson?: Buffer | null;
+  uploadHttpCacheVersion: number;
+  lsRefsHttpCache: CachedUploadHttpEntry[];
+  fetchHttpCache: CachedUploadHttpEntry[];
+}
+
+export const ZERO_OID = '0000000000000000000000000000000000000000';
+
+export const HTTP_KA_SUFFIX = Buffer.from('\r\nX-GitHub-Request-Id: 1\r\nConnection: keep-alive\r\n\r\n', 'ascii');
+
+export function buildHttpBuffer(prefix: Buffer, suffix: Buffer, body: Buffer): Buffer {
+  const clStr = String(body.length);
+  const out = Buffer.allocUnsafe(prefix.length + clStr.length + suffix.length + body.length);
+  let off = 0;
+  prefix.copy(out, off);
+  off += prefix.length;
+  off += out.write(clStr, off, 'ascii');
+  suffix.copy(out, off);
+  off += suffix.length;
+  body.copy(out, off);
+  return out;
+}
+
+const TWO_DIGITS: readonly string[] = Array.from({ length: 60 }, (_, i) => (i < 10 ? `0${i}` : String(i)));
+
+let isoCachedDay = Number.NaN;
+let isoCachedDayPrefix = '';
+
+function formatIsoUtcSeconds(epoch: number): string {
+  const day = Math.floor(epoch / 86400);
+  if (day !== isoCachedDay) {
+    isoCachedDayPrefix = new Date(day * 86400 * 1000).toISOString().slice(0, 11);
+    isoCachedDay = day;
+  }
+  const rem = epoch - day * 86400;
+  const hh = (rem / 3600) | 0;
+  const mrem = rem - hh * 3600;
+  const mm = (mrem / 60) | 0;
+  const ss = mrem - mm * 60;
+  return `${isoCachedDayPrefix}${TWO_DIGITS[hh]}:${TWO_DIGITS[mm]}:${TWO_DIGITS[ss]}.000Z`;
 }
 
 export class ForgeStore {
   readonly expectedToken: string;
+  readonly expectedTokenBuf: Buffer | null;
+  readonly expectedBearerLen: number;
   readonly baseEpoch: number;
+  mutationEpoch = 0;
   private seq = 0;
+  private reqSeq = 0;
   private nextObjId = 1000;
   private viewerLogin: string | null = null;
+  private cachedUserJsonLogin: string | null = null;
+  private cachedUserJson = '{"login":"viewer"}';
   readonly repos = new Map<string, Repository>();
   readonly repoOrder: Repository[] = [];
 
   constructor() {
     this.expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+    this.expectedTokenBuf = this.expectedToken ? Buffer.from(this.expectedToken, 'utf8') : null;
+    this.expectedBearerLen = this.expectedTokenBuf ? 7 + this.expectedTokenBuf.length : 0;
     const nowEnv = process.env.MAKEFUN_TRIAL_NOW;
     const parsed = nowEnv ? Date.parse(nowEnv) : NaN;
     this.baseEpoch = Number.isFinite(parsed) ? Math.floor(parsed / 1000) : 1793491200; // 2026-11-01T00:00:00Z
@@ -114,18 +173,27 @@ export class ForgeStore {
   }
 
   nextRequestId(): string {
-    this.seq += 1;
-    return `req-${this.seq}`;
+    this.reqSeq += 1;
+    return `req-${this.reqSeq}`;
   }
 
   nextTimestamp(): { iso: string; epoch: number } {
     this.seq += 1;
     const epoch = this.baseEpoch + this.seq;
-    return { iso: new Date(epoch * 1000).toISOString(), epoch };
+    return { iso: formatIsoUtcSeconds(epoch), epoch };
   }
 
   getViewerLogin(): string {
     return this.viewerLogin ?? 'viewer';
+  }
+
+  getViewerUserJson(): string {
+    const login = this.viewerLogin ?? 'viewer';
+    if (this.cachedUserJsonLogin !== login) {
+      this.cachedUserJsonLogin = login;
+      this.cachedUserJson = JSON.stringify({ login });
+    }
+    return this.cachedUserJson;
   }
 
   isAuthorized(authHeader: string | undefined): boolean {
@@ -133,6 +201,31 @@ export class ForgeStore {
     if (!authHeader) return false;
     const m = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
     return m !== null && m[1] === this.expectedToken;
+  }
+
+  /** Fast raw-Buffer authorization check; returns 1 (ok), 0 (unauthorized), -1 (fallback). */
+  isAuthorizedFast(buf: Buffer, start: number, end: number): number {
+    if (this.expectedTokenBuf === null) return 1;
+    if (start < 0) return 0;
+    const len = end - start;
+    if (len !== this.expectedBearerLen) {
+      // Handle unusual whitespace like `Bearer  token` via fallback
+      if (len > 7) return -1;
+      return 0;
+    }
+    // Check "bearer " case-insensitively
+    if (
+      (buf[start]! | 0x20) !== 0x62 ||
+      (buf[start + 1]! | 0x20) !== 0x65 ||
+      (buf[start + 2]! | 0x20) !== 0x61 ||
+      (buf[start + 3]! | 0x20) !== 0x72 ||
+      (buf[start + 4]! | 0x20) !== 0x65 ||
+      (buf[start + 5]! | 0x20) !== 0x72 ||
+      buf[start + 6]! !== 0x20
+    ) {
+      return -1;
+    }
+    return buf.compare(this.expectedTokenBuf, 0, this.expectedTokenBuf.length, start + 7, end) === 0 ? 1 : 0;
   }
 
   /** Learn viewerLogin on first authenticated access to a created repo, or verify owner matches. */
@@ -167,6 +260,13 @@ export class ForgeStore {
       nextPullNumber: 1,
       treeCache: new Map(),
       fetchCache: new Map(),
+      deleted: false,
+      refsVersion: 1,
+      cachedReceivePackAdHttp: null,
+      cachedRepoJson: null,
+      uploadHttpCacheVersion: 0,
+      lsRefsHttpCache: [],
+      fetchHttpCache: [],
     };
     if (opts.auto_init) {
       const blobSha = writeObject(repo, 'blob', Buffer.from(`# ${name}\n`, 'utf8'));
@@ -176,25 +276,68 @@ export class ForgeStore {
     }
     this.repos.set(name, repo);
     this.repoOrder.push(repo);
+    this.mutationEpoch += 1;
     return repo;
   }
 
   deleteRepo(owner: string, name: string): boolean {
     const repo = this.resolveRepo(owner, name);
     if (!repo) return false;
+    repo.deleted = true;
     this.repos.delete(name);
     const idx = this.repoOrder.indexOf(repo);
     if (idx !== -1) this.repoOrder.splice(idx, 1);
+    repo.refsVersion += 1;
+    repo.cachedReceivePackAdHttp = null;
+    repo.cachedRepoJson = null;
+    this.mutationEpoch += 1;
     return true;
   }
+}
+
+export function invalidateIssueCache(store: ForgeStore, issue: Issue): void {
+  issue.cachedJsonBuf = null;
+  issue.cachedHttpBuf = null;
+  store.mutationEpoch += 1;
+}
+
+export function invalidateRepoRefs(store: ForgeStore, repo: Repository): void {
+  repo.refsVersion += 1;
+  repo.cachedReceivePackAdHttp = null;
+  store.mutationEpoch += 1;
+}
+
+export function invalidateRepoMeta(store: ForgeStore, repo: Repository): void {
+  repo.cachedRepoJson = null;
+  store.mutationEpoch += 1;
 }
 
 // ---------------------------------------------------------------------------
 // Git object & packfile primitives
 
+const HASH_HDR_BUF = Buffer.allocUnsafe(32);
+
 export function hashObject(type: GitObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return createHash('sha1').update(header).update(data).digest('hex');
+  let off = HASH_HDR_BUF.write(type, 0, 'ascii');
+  HASH_HDR_BUF[off++] = 0x20;
+  let len = data.length;
+  if (len === 0) {
+    HASH_HDR_BUF[off++] = 0x30;
+  } else {
+    const start = off;
+    while (len > 0) {
+      const q = Math.floor(len / 10);
+      HASH_HDR_BUF[off++] = 0x30 + (len - q * 10);
+      len = q;
+    }
+    for (let l = start, r = off - 1; l < r; l += 1, r -= 1) {
+      const tmp = HASH_HDR_BUF[l]!;
+      HASH_HDR_BUF[l] = HASH_HDR_BUF[r]!;
+      HASH_HDR_BUF[r] = tmp;
+    }
+  }
+  HASH_HDR_BUF[off++] = 0x00;
+  return createHash('sha1').update(HASH_HDR_BUF.subarray(0, off)).update(data).digest('hex');
 }
 
 export function writeObject(repo: Repository, type: GitObjType, data: Buffer): string {
@@ -203,6 +346,52 @@ export function writeObject(repo: Repository, type: GitObjType, data: Buffer): s
     repo.objects.set(sha, { type, data });
   }
   return sha;
+}
+
+export function getCommitParent0(obj: GitObject): string | null {
+  if (obj.parent0 !== undefined) return obj.parent0;
+  const data = obj.data;
+  const len = data.length;
+  // Fast O(1) path for standard `tree <40-hex>\nparent <40-hex>\n...` commits
+  if (
+    len >= 93 &&
+    data[45] === 0x0a &&
+    data[46] === 0x70 &&
+    data[47] === 0x61 &&
+    data[48] === 0x72 &&
+    data[49] === 0x65 &&
+    data[50] === 0x6e &&
+    data[51] === 0x74 &&
+    data[52] === 0x20
+  ) {
+    const p0 = data.toString('ascii', 53, 93);
+    obj.parent0 = p0;
+    return p0;
+  }
+  let pos = 0;
+  while (pos < len) {
+    const nl = data.indexOf(0x0a, pos);
+    const lineEnd = nl === -1 ? len : nl;
+    if (lineEnd === pos) break;
+    if (
+      lineEnd - pos >= 47 &&
+      data[pos] === 0x70 &&
+      data[pos + 1] === 0x61 &&
+      data[pos + 2] === 0x72 &&
+      data[pos + 3] === 0x65 &&
+      data[pos + 4] === 0x6e &&
+      data[pos + 5] === 0x74 &&
+      data[pos + 6] === 0x20
+    ) {
+      const p0 = data.toString('ascii', pos + 7, pos + 47);
+      obj.parent0 = p0;
+      return p0;
+    }
+    if (nl === -1) break;
+    pos = nl + 1;
+  }
+  obj.parent0 = null;
+  return null;
 }
 
 export function parseCommit(data: Buffer): ParsedCommit {
@@ -339,8 +528,9 @@ export function walkCommitHistory(repo: Repository, tipSha: string, limit = 1000
   const result: string[] = [];
   const seen = new Set<string>();
   const queue = [tipSha];
-  while (queue.length > 0 && result.length < limit) {
-    const sha = queue.shift()!;
+  let head = 0;
+  while (head < queue.length && result.length < limit) {
+    const sha = queue[head++]!;
     if (seen.has(sha)) continue;
     seen.add(sha);
     const obj = repo.objects.get(sha);
@@ -371,12 +561,22 @@ export function isAncestor(repo: Repository, ancestorSha: string, descendantSha:
   return false;
 }
 
+export function isFastForward(repo: Repository, oldOid: string, newOid: string): boolean {
+  if (oldOid === ZERO_OID || oldOid === newOid) return true;
+  const newObj = repo.objects.get(newOid);
+  if (newObj && newObj.type === 'commit' && getCommitParent0(newObj) === oldOid) {
+    return true;
+  }
+  return isAncestor(repo, oldOid, newOid);
+}
+
 export function findMergeBase(repo: Repository, shaA: string, shaB: string): string | null {
   const ancestorsA = new Set<string>(walkCommitHistory(repo, shaA));
   const queue = [shaB];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const sha = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const sha = queue[head++]!;
     if (ancestorsA.has(sha)) return sha;
     if (seen.has(sha)) continue;
     seen.add(sha);
@@ -445,8 +645,11 @@ export const PKT_DELIM = Buffer.from('0001', 'ascii');
 
 export function pktLine(data: string | Buffer): Buffer {
   const payload = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
-  const len = (payload.length + 4).toString(16).padStart(4, '0');
-  return Buffer.concat([Buffer.from(len, 'ascii'), payload]);
+  const totalLen = payload.length + 4;
+  const out = Buffer.allocUnsafe(totalLen);
+  out.write(totalLen.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  payload.copy(out, 4);
+  return out;
 }
 
 export interface PktItem {
@@ -458,7 +661,7 @@ export function parsePktLines(buf: Buffer): { items: PktItem[]; rest: Buffer } {
   const items: PktItem[] = [];
   let off = 0;
   while (off + 4 <= buf.length) {
-    const hex = buf.subarray(off, off + 4).toString('ascii');
+    const hex = buf.toString('ascii', off, off + 4);
     if (hex === '0000') {
       items.push({ type: 'flush' });
       off += 4;
@@ -479,15 +682,6 @@ export function parsePktLines(buf: Buffer): { items: PktItem[]; rest: Buffer } {
     off += len;
   }
   return { items, rest: buf.subarray(off) };
-}
-
-function inflateFromOffset(buf: Buffer, offset: number): { data: Buffer; bytesRead: number } {
-  // Node's inflateSync with info: true returns { buffer, engine } where engine.bytesWritten is input bytes consumed
-  const res = inflateSync(buf.subarray(offset), { info: true }) as unknown as {
-    buffer: Buffer;
-    engine: { bytesWritten: number };
-  };
-  return { data: res.buffer, bytesRead: res.engine.bytesWritten };
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -540,78 +734,122 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return out;
 }
 
+const PACK_MAGIC = 0x5041434b; // 'PACK'
+const PACK_OBJ_TYPES: readonly (GitObjType | undefined)[] = [undefined, 'commit', 'tree', 'blob', 'tag'];
+const UNPACK_OFFSETS: number[] = [];
+const UNPACK_TYPES: GitObjType[] = [];
+const UNPACK_DATAS: Buffer[] = [];
+
 export function unpackPackfile(repo: Repository, pack: Buffer): void {
   if (pack.length < 32) throw new Error('packfile too short');
-  if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad PACK magic');
+  if (pack.readUInt32BE(0) !== PACK_MAGIC) throw new Error('bad PACK magic');
   const count = pack.readUInt32BE(8);
   let off = 12;
 
-  const byOffset = new Map<number, { type: GitObjType; data: Buffer; sha: string }>();
-  const pendingRefDeltas: Array<{ baseSha: string; delta: Buffer }> = [];
+  let byOffset: Map<number, { type: GitObjType; data: Buffer }> | null = null;
+  let entryCount = 0;
+  let pendingRefDeltas: Array<{ baseSha: string; delta: Buffer }> | null = null;
 
-  const typeMap: Record<number, GitObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
-
-  for (let i = 0; i < count; i += 1) {
-    const entryStart = off;
-    let c = pack[off++]!;
-    const objType = (c >> 4) & 7;
-    while (c & 0x80) {
-      c = pack[off++]!;
-    }
-
-    if (objType >= 1 && objType <= 4) {
-      const { data, bytesRead } = inflateFromOffset(pack, off);
-      off += bytesRead;
-      const type = typeMap[objType]!;
-      const sha = writeObject(repo, type, data);
-      byOffset.set(entryStart, { type, data, sha });
-    } else if (objType === 6) {
-      // OBJ_OFS_DELTA
-      let b = pack[off++]!;
-      let backOff = b & 0x7f;
-      while (b & 0x80) {
-        b = pack[off++]!;
-        backOff = ((backOff + 1) << 7) | (b & 0x7f);
+  try {
+    for (let i = 0; i < count; i += 1) {
+      const entryStart = off;
+      let c = pack[off++]!;
+      const objType = (c >> 4) & 7;
+      while (c & 0x80) {
+        c = pack[off++]!;
       }
-      const { data: delta, bytesRead } = inflateFromOffset(pack, off);
-      off += bytesRead;
-      const baseEntry = byOffset.get(entryStart - backOff);
-      if (!baseEntry) throw new Error(`missing OFS_DELTA base at ${entryStart - backOff}`);
-      const target = applyDelta(baseEntry.data, delta);
-      const sha = writeObject(repo, baseEntry.type, target);
-      byOffset.set(entryStart, { type: baseEntry.type, data: target, sha });
-    } else if (objType === 7) {
-      // OBJ_REF_DELTA
-      const baseSha = pack.subarray(off, off + 20).toString('hex');
-      off += 20;
-      const { data: delta, bytesRead } = inflateFromOffset(pack, off);
-      off += bytesRead;
-      const baseObj = repo.objects.get(baseSha);
-      if (baseObj) {
-        const target = applyDelta(baseObj.data, delta);
-        const sha = writeObject(repo, baseObj.type, target);
-        byOffset.set(entryStart, { type: baseObj.type, data: target, sha });
+
+      if (objType >= 1 && objType <= 4) {
+        const res = inflateSync(pack.subarray(off), { info: true }) as unknown as {
+          buffer: Buffer;
+          engine: { bytesWritten: number };
+        };
+        off += res.engine.bytesWritten;
+        const type = PACK_OBJ_TYPES[objType]!;
+        const data = res.buffer;
+        writeObject(repo, type, data);
+        if (byOffset !== null) {
+          byOffset.set(entryStart, { type, data });
+        } else {
+          UNPACK_OFFSETS[entryCount] = entryStart;
+          UNPACK_TYPES[entryCount] = type;
+          UNPACK_DATAS[entryCount] = data;
+          entryCount += 1;
+        }
+      } else if (objType === 6) {
+        // OBJ_OFS_DELTA
+        let b = pack[off++]!;
+        let backOff = b & 0x7f;
+        while (b & 0x80) {
+          b = pack[off++]!;
+          backOff = ((backOff + 1) << 7) | (b & 0x7f);
+        }
+        const res = inflateSync(pack.subarray(off), { info: true }) as unknown as {
+          buffer: Buffer;
+          engine: { bytesWritten: number };
+        };
+        off += res.engine.bytesWritten;
+        if (byOffset === null) {
+          byOffset = new Map();
+          for (let j = 0; j < entryCount; j += 1) {
+            byOffset.set(UNPACK_OFFSETS[j]!, { type: UNPACK_TYPES[j]!, data: UNPACK_DATAS[j]! });
+          }
+        }
+        const baseEntry = byOffset.get(entryStart - backOff);
+        if (!baseEntry) throw new Error(`missing OFS_DELTA base at ${entryStart - backOff}`);
+        const target = applyDelta(baseEntry.data, res.buffer);
+        writeObject(repo, baseEntry.type, target);
+        byOffset.set(entryStart, { type: baseEntry.type, data: target });
+      } else if (objType === 7) {
+        // OBJ_REF_DELTA
+        const baseSha = pack.subarray(off, off + 20).toString('hex');
+        off += 20;
+        const res = inflateSync(pack.subarray(off), { info: true }) as unknown as {
+          buffer: Buffer;
+          engine: { bytesWritten: number };
+        };
+        off += res.engine.bytesWritten;
+        const baseObj = repo.objects.get(baseSha);
+        if (baseObj) {
+          const target = applyDelta(baseObj.data, res.buffer);
+          writeObject(repo, baseObj.type, target);
+          if (byOffset !== null) {
+            byOffset.set(entryStart, { type: baseObj.type, data: target });
+          } else {
+            UNPACK_OFFSETS[entryCount] = entryStart;
+            UNPACK_TYPES[entryCount] = baseObj.type;
+            UNPACK_DATAS[entryCount] = target;
+            entryCount += 1;
+          }
+        } else {
+          if (pendingRefDeltas === null) pendingRefDeltas = [];
+          pendingRefDeltas.push({ baseSha, delta: res.buffer });
+        }
       } else {
-        pendingRefDeltas.push({ baseSha, delta });
+        throw new Error(`unsupported pack object type ${objType}`);
       }
-    } else {
-      throw new Error(`unsupported pack object type ${objType}`);
     }
-  }
 
-  for (let pass = 0; pass < pendingRefDeltas.length && pendingRefDeltas.length > 0; pass += 1) {
-    for (let i = pendingRefDeltas.length - 1; i >= 0; i -= 1) {
-      const item = pendingRefDeltas[i]!;
-      const baseObj = repo.objects.get(item.baseSha);
-      if (baseObj) {
-        const target = applyDelta(baseObj.data, item.delta);
-        writeObject(repo, baseObj.type, target);
-        pendingRefDeltas.splice(i, 1);
+    if (pendingRefDeltas !== null) {
+      for (let pass = 0; pass < pendingRefDeltas.length && pendingRefDeltas.length > 0; pass += 1) {
+        for (let i = pendingRefDeltas.length - 1; i >= 0; i -= 1) {
+          const item = pendingRefDeltas[i]!;
+          const baseObj = repo.objects.get(item.baseSha);
+          if (baseObj) {
+            const target = applyDelta(baseObj.data, item.delta);
+            writeObject(repo, baseObj.type, target);
+            pendingRefDeltas.splice(i, 1);
+          }
+        }
+      }
+      if (pendingRefDeltas.length > 0) {
+        throw new Error(`unresolved REF_DELTA base ${pendingRefDeltas[0]!.baseSha}`);
       }
     }
-  }
-  if (pendingRefDeltas.length > 0) {
-    throw new Error(`unresolved REF_DELTA base ${pendingRefDeltas[0]!.baseSha}`);
+  } finally {
+    for (let j = 0; j < entryCount; j += 1) {
+      UNPACK_DATAS[j] = undefined!;
+    }
   }
 }
 
@@ -702,8 +940,9 @@ export function collectReachableObjects(
   };
 
   const queue: Array<{ sha: string; d: number }> = wants.map((sha) => ({ sha, d: 1 }));
-  while (queue.length > 0) {
-    const { sha, d } = queue.shift()!;
+  let qHead = 0;
+  while (qHead < queue.length) {
+    const { sha, d } = queue[qHead++]!;
     if (seenCommits.has(sha)) continue;
     seenCommits.add(sha);
     const obj = repo.objects.get(sha);
@@ -718,14 +957,13 @@ export function collectReachableObjects(
       continue;
     }
     if (obj.type === 'commit') {
+      const parsed = parseCommit(obj.data);
       if (!visited.has(sha) && !haveSet.has(sha)) {
         visited.add(sha);
         out.push(sha);
-        const parsed = parseCommit(obj.data);
         addTree(parsed.tree);
       }
       if (depth === undefined || d < depth) {
-        const parsed = parseCommit(obj.data);
         for (const p of parsed.parents) {
           queue.push({ sha: p, d: d + 1 });
         }
@@ -740,37 +978,50 @@ export function collectReachableObjects(
   return out;
 }
 
-export function buildPackfile(repo: Repository, oids: string[]): Buffer {
-  const typeNum: Record<GitObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-  const chunks: Buffer[] = [];
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(oids.length, 8);
-  chunks.push(header);
+const TYPE_NUM: Record<GitObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
+export function buildPackfile(repo: Repository, oids: string[]): Buffer {
+  const objs: GitObject[] = [];
+  let bodyLen = 12;
   for (const oid of oids) {
     const obj = repo.objects.get(oid);
     if (!obj) continue;
+    if (!obj.deflated) obj.deflated = deflateSync(obj.data);
+    objs.push(obj);
+    let hdrLen = 1;
+    let size = obj.data.length >> 4;
+    while (size > 0) {
+      hdrLen += 1;
+      size >>= 7;
+    }
+    bodyLen += hdrLen + obj.deflated.length;
+  }
+
+  const out = Buffer.allocUnsafe(bodyLen + 20);
+  out.write('PACK', 0, 'ascii');
+  out.writeUInt32BE(2, 4);
+  out.writeUInt32BE(objs.length, 8);
+  let off = 12;
+
+  for (const obj of objs) {
     let size = obj.data.length;
-    const t = typeNum[obj.type];
-    const hdrBytes: number[] = [];
+    const t = TYPE_NUM[obj.type];
     let first = (t << 4) | (size & 0x0f);
     size >>= 4;
     if (size > 0) first |= 0x80;
-    hdrBytes.push(first);
+    out[off++] = first;
     while (size > 0) {
       let b = size & 0x7f;
       size >>= 7;
       if (size > 0) b |= 0x80;
-      hdrBytes.push(b);
+      out[off++] = b;
     }
-    chunks.push(Buffer.from(hdrBytes));
-    if (!obj.deflated) obj.deflated = deflateSync(obj.data);
-    chunks.push(obj.deflated);
+    const def = obj.deflated!;
+    def.copy(out, off);
+    off += def.length;
   }
 
-  const body = Buffer.concat(chunks);
-  const checksum = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, checksum]);
+  const checksum = createHash('sha1').update(out.subarray(0, bodyLen)).digest();
+  checksum.copy(out, bodyLen);
+  return out;
 }

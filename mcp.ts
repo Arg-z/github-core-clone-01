@@ -1,6 +1,5 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import { formatIssue, formatPull, formatRepo, mergePullRequest } from './rest.ts';
-import { ForgeStore, resolveRefOrSha, type PullRequest } from './store.ts';
+import { formatIssue, formatPull, formatRepo, mergePullRequest, sendRawBuf, type HttpRequest, type HttpResponse } from './rest.ts';
+import { ForgeStore, invalidateIssueCache, resolveRefOrSha, type Issue, type PullRequest } from './store.ts';
 
 interface McpToolDef {
   name: string;
@@ -99,14 +98,28 @@ const TOOLS: McpToolDef[] = [
   },
 ];
 
-function sendRpc(res: ServerResponse, status: number, payload: unknown, reqId: string): void {
-  const text = JSON.stringify(payload);
+const TOOLS_RESULT_JSON = JSON.stringify({ tools: TOOLS });
+const SERVER_DISCOVER_RESULT_JSON = JSON.stringify({
+  supportedVersions: ['2026-07-28', '2025-11-25'],
+  capabilities: { tools: {} },
+  serverInfo: { name: 'makefun-forge', version: '1.0.0' },
+});
+const INIT_TAIL_JSON = ',"capabilities":{"tools":{}},"serverInfo":{"name":"makefun-forge","version":"1.0.0"}}}';
+const ERR_AUTH_BUF = Buffer.from('{"message":"Requires authentication"}', 'ascii');
+const ERR_METHOD_BUF = Buffer.from('{"message":"Method Not Allowed"}', 'ascii');
+const ERR_PARSE_BUF = Buffer.from('{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}', 'ascii');
+
+function sendRpcText(res: HttpResponse, status: number, text: string, reqId: string): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(text),
     'x-github-request-id': reqId,
   });
   res.end(text);
+}
+
+function sendRpc(res: HttpResponse, status: number, payload: unknown, reqId: string): void {
+  sendRpcText(res, status, JSON.stringify(payload), reqId);
 }
 
 function toolOk(data: unknown): { content: Array<{ type: 'text'; text: string }>; isError: false } {
@@ -162,21 +175,23 @@ function executeTool(store: ForgeStore, name: string, args: Record<string, unkno
     if (!repo) return { kind: 'ok', result: toolErr('Repository not found') };
     const body = typeof args.body === 'string' ? args.body : '';
     const ts = store.nextTimestamp();
-    const issue = {
+    const issue: Issue = {
       id: store.nextId(),
       number: repo.nextIssueNumber++,
       title,
       body,
-      state: 'open' as const,
+      state: 'open',
       labels: [],
       user: { login: store.getViewerLogin() },
       comments: [],
       created_at: ts.iso,
       updated_at: ts.iso,
       closed_at: null,
+      cachedHttpBuf: null,
     };
     repo.issues.push(issue);
     repo.issueByNumber.set(issue.number, issue);
+    invalidateIssueCache(store, issue);
     return { kind: 'ok', result: toolOk(formatIssue(issue)) };
   }
 
@@ -222,6 +237,7 @@ function executeTool(store: ForgeStore, name: string, args: Record<string, unkno
       updated_at: ts.iso,
     };
     repo.pulls.push(pr);
+    store.mutationEpoch += 1;
     return { kind: 'ok', result: toolOk(formatPull(pr)) };
   }
 
@@ -244,8 +260,8 @@ function executeTool(store: ForgeStore, name: string, args: Record<string, unkno
 }
 
 export function handleMcp(
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: HttpRequest,
+  res: HttpResponse,
   store: ForgeStore,
   url: URL,
   rawBody: Buffer,
@@ -253,13 +269,15 @@ export function handleMcp(
 ): boolean {
   if (url.pathname !== '/mcp') return false;
 
-  if (!store.isAuthorized(req.headers.authorization)) {
-    sendRpc(res, 401, { message: 'Requires authentication' }, reqId);
+  const baseHeaders = { 'x-github-request-id': reqId };
+  const authHeader = Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : req.headers.authorization;
+  if (!store.isAuthorized(authHeader)) {
+    sendRawBuf(res, 401, ERR_AUTH_BUF, baseHeaders);
     return true;
   }
 
   if (req.method !== 'POST') {
-    sendRpc(res, 405, { message: 'Method Not Allowed' }, reqId);
+    sendRawBuf(res, 405, ERR_METHOD_BUF, baseHeaders);
     return true;
   }
 
@@ -267,12 +285,12 @@ export function handleMcp(
   try {
     const parsed = JSON.parse(rawBody.toString('utf8'));
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      sendRpc(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, reqId);
+      sendRawBuf(res, 400, ERR_PARSE_BUF, baseHeaders);
       return true;
     }
     msg = parsed as Record<string, unknown>;
   } catch {
-    sendRpc(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, reqId);
+    sendRawBuf(res, 400, ERR_PARSE_BUF, baseHeaders);
     return true;
   }
 
@@ -281,50 +299,29 @@ export function handleMcp(
   const params = typeof msg.params === 'object' && msg.params !== null ? (msg.params as Record<string, unknown>) : {};
 
   if (method === 'notifications/initialized') {
-    res.writeHead(202, { 'x-github-request-id': reqId });
+    res.writeHead(202, baseHeaders);
     res.end();
     return true;
   }
 
   if (method === 'server/discover') {
-    sendRpc(
-      res,
-      200,
-      {
-        jsonrpc: '2.0',
-        id,
-        result: {
-          supportedVersions: ['2026-07-28', '2025-11-25'],
-          capabilities: { tools: {} },
-          serverInfo: { name: 'makefun-forge', version: '1.0.0' },
-        },
-      },
-      reqId,
-    );
+    sendRpcText(res, 200, `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${SERVER_DISCOVER_RESULT_JSON}}`, reqId);
     return true;
   }
 
   if (method === 'initialize') {
     const requested = typeof params.protocolVersion === 'string' ? params.protocolVersion : '2026-07-28';
-    sendRpc(
+    sendRpcText(
       res,
       200,
-      {
-        jsonrpc: '2.0',
-        id,
-        result: {
-          protocolVersion: requested,
-          capabilities: { tools: {} },
-          serverInfo: { name: 'makefun-forge', version: '1.0.0' },
-        },
-      },
+      `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":{"protocolVersion":${JSON.stringify(requested)}${INIT_TAIL_JSON}`,
       reqId,
     );
     return true;
   }
 
   if (method === 'tools/list') {
-    sendRpc(res, 200, { jsonrpc: '2.0', id, result: { tools: TOOLS } }, reqId);
+    sendRpcText(res, 200, `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":${TOOLS_RESULT_JSON}}`, reqId);
     return true;
   }
 

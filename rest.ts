@@ -1,12 +1,16 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { isAscii } from 'node:buffer';
 import {
   ForgeStore,
+  HTTP_KA_SUFFIX,
+  buildHttpBuffer,
   buildTreeFromFiles,
   createCommit,
   findMergeBase,
   getCommitFiles,
+  invalidateIssueCache,
+  invalidateRepoMeta,
+  invalidateRepoRefs,
   parseCommit,
-  parseTree,
   resolveRefOrSha,
   threeWayMergeFiles,
   walkCommitHistory,
@@ -16,10 +20,72 @@ import {
   type Repository,
 } from './store.ts';
 
+export interface HttpRequest {
+  method?: string;
+  url?: string;
+  headers: Record<string, string | string[] | undefined>;
+}
+
+export interface HttpResponse {
+  writeHead(status: number, headers?: Record<string, string | number>): unknown;
+  end(body?: string | Buffer): unknown;
+}
+
+export interface SimpleIssueSlices {
+  titleStart: number;
+  titleEnd: number;
+  bodyStart: number;
+  bodyEnd: number;
+}
+
 const JSON_TYPE = 'application/json; charset=utf-8';
+const HTTP_200_JSON_PREFIX = Buffer.from(
+  'HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ',
+  'ascii',
+);
+const HTTP_201_JSON_PREFIX = Buffer.from(
+  'HTTP/1.1 201 Created\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ',
+  'ascii',
+);
+
+const ROOT_JSON_BUF = Buffer.from(
+  JSON.stringify({ current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }),
+  'utf8',
+);
+const META_JSON_BUF = Buffer.from(JSON.stringify({ installed_version: '3.14.0' }), 'utf8');
+const ERR_AUTH_BUF = Buffer.from('{"message":"Requires authentication"}', 'ascii');
+const ERR_NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}', 'ascii');
+const ERR_BAD_JSON_BUF = Buffer.from('{"message":"Problems parsing JSON"}', 'ascii');
+const EMPTY_ARRAY_BUF = Buffer.from('[]', 'ascii');
+
+const JSON_TITLE_PRE = Buffer.from('{"title":"', 'ascii');
+const JSON_MID_BODY = Buffer.from(',"body":"', 'ascii');
+
+const ISSUE_P1 = Buffer.from('{"id":', 'ascii');
+const ISSUE_P2 = Buffer.from(',"number":', 'ascii');
+const ISSUE_P3 = Buffer.from(',"title":', 'ascii');
+const ISSUE_P4 = Buffer.from(',"body":', 'ascii');
+const ISSUE_P5 = Buffer.from(',"state":"open","labels":[],"user":', 'ascii');
+const ISSUE_P6 = Buffer.from(',"comments":0,"created_at":"', 'ascii');
+const ISSUE_P7 = Buffer.from('","updated_at":"', 'ascii');
+const ISSUE_P8 = Buffer.from('","closed_at":null}', 'ascii');
+
+export function sendRawBuf(
+  res: HttpResponse,
+  status: number,
+  buf: Buffer,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': buf.length,
+    ...headers,
+  });
+  res.end(buf);
+}
 
 export function sendJson(
-  res: ServerResponse,
+  res: HttpResponse,
   status: number,
   body: unknown,
   headers: Readonly<Record<string, string>> = {},
@@ -50,6 +116,18 @@ export function formatRepo(store: ForgeStore, repo: Repository): Record<string, 
   };
 }
 
+export function getRepoJsonBuf(store: ForgeStore, repo: Repository): Buffer {
+  if (repo.cachedRepoJson !== null && repo.cachedRepoJson !== undefined) {
+    return repo.cachedRepoJson;
+  }
+  const buf = Buffer.from(JSON.stringify(formatRepo(store, repo)), 'utf8');
+  // Cache once viewerLogin is settled so full_name/owner never reflects fallback 'viewer'
+  if (store.getViewerLogin() !== 'viewer') {
+    repo.cachedRepoJson = buf;
+  }
+  return buf;
+}
+
 export function formatIssue(issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
@@ -67,10 +145,166 @@ export function formatIssue(issue: Issue): Record<string, unknown> {
 }
 
 export function getIssueJsonBuf(issue: Issue): Buffer {
-  if (issue.cachedJsonBuf === undefined) {
-    issue.cachedJsonBuf = Buffer.from(JSON.stringify(formatIssue(issue)), 'utf8');
+  let buf = issue.cachedJsonBuf;
+  if (buf !== undefined && buf !== null) return buf;
+  buf = Buffer.from(JSON.stringify(formatIssue(issue)), 'utf8');
+  issue.cachedJsonBuf = buf;
+  return buf;
+}
+
+export function getIssueHttpBuf(issue: Issue): Buffer {
+  const cached = issue.cachedHttpBuf;
+  if (cached !== undefined && cached !== null) return cached;
+  if (issue.cachedJsonBuf !== undefined && issue.cachedJsonBuf !== null) {
+    const buf = buildHttpBuffer(HTTP_200_JSON_PREFIX, HTTP_KA_SUFFIX, issue.cachedJsonBuf);
+    issue.cachedHttpBuf = buf;
+    return buf;
   }
-  return issue.cachedJsonBuf;
+  const jsonStr = JSON.stringify(formatIssue(issue));
+  const bodyLen = Buffer.byteLength(jsonStr, 'utf8');
+  const clStr = String(bodyLen);
+  const hdrLen = HTTP_200_JSON_PREFIX.length + clStr.length + HTTP_KA_SUFFIX.length;
+  const buf = Buffer.allocUnsafe(hdrLen + bodyLen);
+  let off = 0;
+  HTTP_200_JSON_PREFIX.copy(buf, off);
+  off += HTTP_200_JSON_PREFIX.length;
+  off += buf.write(clStr, off, 'ascii');
+  HTTP_KA_SUFFIX.copy(buf, off);
+  off += HTTP_KA_SUFFIX.length;
+  buf.write(jsonStr, off, 'utf8');
+  issue.cachedHttpBuf = buf;
+  issue.cachedJsonBuf = buf.subarray(hdrLen);
+  return buf;
+}
+
+/** Zero-parse validator for simple ASCII `{"title":"...","body":"..."}` payloads without escapes. */
+export function parseSimpleIssueJson(body: Buffer): SimpleIssueSlices | null {
+  const len = body.length;
+  if (len < 13 || body[0] !== 0x7b || body[len - 1] !== 0x7d) return null;
+  if (!isAscii(body)) return null;
+  if (body.indexOf(0x5c) !== -1) return null; // backslash escape -> JSON.parse fallback
+  if (body.compare(JSON_TITLE_PRE, 0, 10, 0, 10) !== 0) return null;
+
+  const q1 = body.indexOf(0x22, 10);
+  if (q1 === -1) return null;
+  for (let i = 10; i < q1; i += 1) {
+    if (body[i]! < 0x20) return null;
+  }
+
+  if (q1 + 2 === len) {
+    return { titleStart: 10, titleEnd: q1, bodyStart: 0, bodyEnd: 0 };
+  }
+  if (q1 + 12 <= len && body.compare(JSON_MID_BODY, 0, 9, q1 + 1, q1 + 10) === 0) {
+    const bodyStart = q1 + 10;
+    const q2 = body.indexOf(0x22, bodyStart);
+    if (q2 !== len - 2) return null;
+    for (let i = bodyStart; i < q2; i += 1) {
+      if (body[i]! < 0x20) return null;
+    }
+    return { titleStart: 10, titleEnd: q1, bodyStart, bodyEnd: q2 };
+  }
+  return null;
+}
+
+export function buildIssueCreateHttpBufFromSlices(
+  id: number,
+  num: number,
+  src: Buffer,
+  slices: SimpleIssueSlices,
+  viewerUserJson: string,
+  iso: string,
+): Buffer {
+  const idStr = String(id);
+  const numStr = String(num);
+  const titleLen = slices.titleEnd - slices.titleStart;
+  const bodyContentLen = slices.bodyEnd - slices.bodyStart;
+  const jsonLen =
+    ISSUE_P1.length +
+    idStr.length +
+    ISSUE_P2.length +
+    numStr.length +
+    ISSUE_P3.length +
+    1 +
+    titleLen +
+    1 +
+    ISSUE_P4.length +
+    1 +
+    bodyContentLen +
+    1 +
+    ISSUE_P5.length +
+    viewerUserJson.length +
+    ISSUE_P6.length +
+    iso.length +
+    ISSUE_P7.length +
+    iso.length +
+    ISSUE_P8.length;
+
+  const clStr = String(jsonLen);
+  const hdrLen = HTTP_201_JSON_PREFIX.length + clStr.length + HTTP_KA_SUFFIX.length;
+  const out = Buffer.allocUnsafe(hdrLen + jsonLen);
+  let off = 0;
+  HTTP_201_JSON_PREFIX.copy(out, off);
+  off += HTTP_201_JSON_PREFIX.length;
+  off += out.write(clStr, off, 'ascii');
+  HTTP_KA_SUFFIX.copy(out, off);
+  off += HTTP_KA_SUFFIX.length;
+
+  ISSUE_P1.copy(out, off);
+  off += ISSUE_P1.length;
+  off += out.write(idStr, off, 'ascii');
+  ISSUE_P2.copy(out, off);
+  off += ISSUE_P2.length;
+  off += out.write(numStr, off, 'ascii');
+  ISSUE_P3.copy(out, off);
+  off += ISSUE_P3.length;
+  out[off++] = 0x22;
+  if (titleLen > 0) {
+    src.copy(out, off, slices.titleStart, slices.titleEnd);
+    off += titleLen;
+  }
+  out[off++] = 0x22;
+  ISSUE_P4.copy(out, off);
+  off += ISSUE_P4.length;
+  out[off++] = 0x22;
+  if (bodyContentLen > 0) {
+    src.copy(out, off, slices.bodyStart, slices.bodyEnd);
+    off += bodyContentLen;
+  }
+  out[off++] = 0x22;
+  ISSUE_P5.copy(out, off);
+  off += ISSUE_P5.length;
+  off += out.write(viewerUserJson, off, 'utf8');
+  ISSUE_P6.copy(out, off);
+  off += ISSUE_P6.length;
+  off += out.write(iso, off, 'ascii');
+  ISSUE_P7.copy(out, off);
+  off += ISSUE_P7.length;
+  off += out.write(iso, off, 'ascii');
+  ISSUE_P8.copy(out, off);
+  return out;
+}
+
+export function buildIssueCreateHttpBuf(
+  id: number,
+  num: number,
+  title: string,
+  body: string,
+  viewerUserJson: string,
+  iso: string,
+): Buffer {
+  const jsonStr = `{"id":${id},"number":${num},"title":${JSON.stringify(title)},"body":${JSON.stringify(body)},"state":"open","labels":[],"user":${viewerUserJson},"comments":0,"created_at":"${iso}","updated_at":"${iso}","closed_at":null}`;
+  const bodyLen = Buffer.byteLength(jsonStr, 'utf8');
+  const clStr = String(bodyLen);
+  const hdrLen = HTTP_201_JSON_PREFIX.length + clStr.length + HTTP_KA_SUFFIX.length;
+  const out = Buffer.allocUnsafe(hdrLen + bodyLen);
+  let off = 0;
+  HTTP_201_JSON_PREFIX.copy(out, off);
+  off += HTTP_201_JSON_PREFIX.length;
+  off += out.write(clStr, off, 'ascii');
+  HTTP_KA_SUFFIX.copy(out, off);
+  off += HTTP_KA_SUFFIX.length;
+  out.write(jsonStr, off, 'utf8');
+  return out;
 }
 
 export function formatPull(pr: PullRequest): Record<string, unknown> {
@@ -170,7 +404,31 @@ export function mergePullRequest(
   pr.merged_at = ts.iso;
   pr.merge_commit_sha = commitSha;
   pr.updated_at = ts.iso;
+  invalidateRepoRefs(store, repo);
   return { ok: true, sha: commitSha };
+}
+
+function commitTreeChange(
+  store: ForgeStore,
+  repo: Repository,
+  refName: string,
+  parentSha: string | null,
+  files: Map<string, { mode: string; sha: string }>,
+  message: string,
+): string {
+  const treeSha = buildTreeFromFiles(repo, files);
+  const ts = store.nextTimestamp();
+  const commitSha = createCommit(
+    repo,
+    treeSha,
+    parentSha ? [parentSha] : [],
+    message,
+    store.getViewerLogin(),
+    ts.epoch,
+  );
+  repo.refs.set(refName, commitSha);
+  invalidateRepoRefs(store, repo);
+  return commitSha;
 }
 
 function parseJsonBody(body: Buffer): { ok: true; value: Record<string, unknown> } | { ok: false } {
@@ -185,8 +443,8 @@ function parseJsonBody(body: Buffer): { ok: true; value: Record<string, unknown>
 }
 
 export function handleRest(
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: HttpRequest,
+  res: HttpResponse,
   store: ForgeStore,
   url: URL,
   rawBody: Buffer,
@@ -198,23 +456,19 @@ export function handleRest(
   const baseHeaders = { 'x-github-request-id': reqId };
   const method = req.method ?? 'GET';
 
-  if (!store.isAuthorized(req.headers.authorization)) {
-    sendJson(res, 401, { message: 'Requires authentication' }, baseHeaders);
+  const authHeader = Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : req.headers.authorization;
+  if (!store.isAuthorized(authHeader)) {
+    sendRawBuf(res, 401, ERR_AUTH_BUF, baseHeaders);
     return true;
   }
 
   if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-    sendJson(
-      res,
-      200,
-      { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' },
-      { ...baseHeaders, 'x-oauth-scopes': 'repo, read:org' },
-    );
+    sendRawBuf(res, 200, ROOT_JSON_BUF, { ...baseHeaders, 'x-oauth-scopes': 'repo, read:org' });
     return true;
   }
 
   if (method === 'GET' && path === '/api/v3/meta') {
-    sendJson(res, 200, { installed_version: '3.14.0' }, baseHeaders);
+    sendRawBuf(res, 200, META_JSON_BUF, baseHeaders);
     return true;
   }
 
@@ -227,7 +481,7 @@ export function handleRest(
   if (method === 'POST' || method === 'PUT' || method === 'PATCH' || (method === 'DELETE' && rawBody.length > 0)) {
     const parsed = parseJsonBody(rawBody);
     if (!parsed.ok) {
-      sendJson(res, 400, { message: 'Problems parsing JSON' }, baseHeaders);
+      sendRawBuf(res, 400, ERR_BAD_JSON_BUF, baseHeaders);
       return true;
     }
     bodyObj = parsed.value;
@@ -242,7 +496,8 @@ export function handleRest(
     const slice = store.repoOrder.slice(start, start + perPage).map((r) => formatRepo(store, r));
     const headers: Record<string, string> = { ...baseHeaders };
     if (start + perPage < total) {
-      const host = req.headers.host ?? '127.0.0.1';
+      const rawHost = req.headers.host;
+      const host = (Array.isArray(rawHost) ? rawHost[0] : rawHost) ?? '127.0.0.1';
       const nextUrl = `http://${host}/api/v3/user/repos?per_page=${perPage}&page=${page + 1}`;
       headers.link = `<${nextUrl}>; rel="next"`;
     }
@@ -267,14 +522,14 @@ export function handleRest(
       sendJson(res, 422, { message: 'Repository creation failed: name already exists' }, baseHeaders);
       return true;
     }
-    sendJson(res, 201, formatRepo(store, repo), baseHeaders);
+    sendRawBuf(res, 201, getRepoJsonBuf(store, repo), baseHeaders);
     return true;
   }
 
   // Routes under /api/v3/repos/:owner/:repo...
   const repoMatch = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)(?:\/(.*))?$/.exec(path);
   if (!repoMatch) {
-    sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+    sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
     return true;
   }
 
@@ -284,22 +539,26 @@ export function handleRest(
 
   const repo = store.resolveRepo(owner, repoName);
   if (!repo) {
-    sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+    sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
     return true;
   }
 
   // /api/v3/repos/:owner/:repo
   if (sub === '') {
     if (method === 'GET') {
-      sendJson(res, 200, formatRepo(store, repo), baseHeaders);
+      sendRawBuf(res, 200, getRepoJsonBuf(store, repo), baseHeaders);
       return true;
     }
     if (method === 'PATCH') {
       if (typeof bodyObj.description === 'string') repo.description = bodyObj.description;
       if (typeof bodyObj.private === 'boolean') repo.private = bodyObj.private;
-      if (typeof bodyObj.default_branch === 'string') repo.default_branch = bodyObj.default_branch;
+      if (typeof bodyObj.default_branch === 'string') {
+        repo.default_branch = bodyObj.default_branch;
+        invalidateRepoRefs(store, repo);
+      }
       repo.updated_at = store.nextTimestamp().iso;
-      sendJson(res, 200, formatRepo(store, repo), baseHeaders);
+      invalidateRepoMeta(store, repo);
+      sendRawBuf(res, 200, getRepoJsonBuf(store, repo), baseHeaders);
       return true;
     }
     if (method === 'DELETE') {
@@ -327,10 +586,12 @@ export function handleRest(
     const shaParam = url.searchParams.get('sha') ?? undefined;
     const tipSha = resolveRefOrSha(repo, shaParam);
     if (!tipSha) {
-      sendJson(res, 200, [], baseHeaders);
+      sendRawBuf(res, 200, EMPTY_ARRAY_BUF, baseHeaders);
       return true;
     }
     const shas = walkCommitHistory(repo, tipSha);
+    const viewer = store.getViewerLogin();
+    const email = `${viewer}@users.noreply.make.fun`;
     const commits = shas.map((s) => {
       const obj = repo.objects.get(s);
       const parsed = obj ? parseCommit(obj.data) : { message: '', author: '' };
@@ -338,7 +599,7 @@ export function handleRest(
         sha: s,
         commit: {
           message: parsed.message,
-          author: { name: store.getViewerLogin(), email: `${store.getViewerLogin()}@users.noreply.make.fun`, date: repo.created_at },
+          author: { name: viewer, email, date: repo.created_at },
         },
       };
     });
@@ -359,6 +620,7 @@ export function handleRest(
       return true;
     }
     repo.refs.set(ref, sha);
+    invalidateRepoRefs(store, repo);
     sendJson(res, 201, { ref, object: { sha, type: 'commit' } }, baseHeaders);
     return true;
   }
@@ -372,7 +634,7 @@ export function handleRest(
       const refParam = url.searchParams.get('ref') ?? undefined;
       const tipSha = resolveRefOrSha(repo, refParam);
       if (!tipSha) {
-        sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+        sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
         return true;
       }
       const files = getCommitFiles(repo, tipSha);
@@ -398,7 +660,6 @@ export function handleRest(
         return true;
       }
 
-      // Check directory
       const prefix = filePath ? `${filePath}/` : '';
       const dirEntries = new Map<string, { type: 'file' | 'dir'; name: string; path: string; sha: string; size: number }>();
       for (const [p, info] of files) {
@@ -417,7 +678,6 @@ export function handleRest(
         } else {
           const dirName = rest.slice(0, slash);
           if (!dirEntries.has(dirName)) {
-            // Compute tree sha deterministically from commit tree
             dirEntries.set(dirName, {
               type: 'dir',
               name: dirName,
@@ -432,7 +692,7 @@ export function handleRest(
         sendJson(res, 200, [...dirEntries.values()], baseHeaders);
         return true;
       }
-      sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+      sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
       return true;
     }
 
@@ -459,17 +719,7 @@ export function handleRest(
       const data = Buffer.from(contentB64.replace(/[\r\n\t ]+/g, ''), 'base64');
       const blobSha = writeObject(repo, 'blob', data);
       files.set(filePath, { mode: '100644', sha: blobSha });
-      const treeSha = buildTreeFromFiles(repo, files);
-      const ts = store.nextTimestamp();
-      const commitSha = createCommit(
-        repo,
-        treeSha,
-        parentSha ? [parentSha] : [],
-        message,
-        store.getViewerLogin(),
-        ts.epoch,
-      );
-      repo.refs.set(refName, commitSha);
+      const commitSha = commitTreeChange(store, repo, refName, parentSha, files, message);
       const name = filePath.split('/').pop() ?? filePath;
       sendJson(
         res,
@@ -492,7 +742,7 @@ export function handleRest(
       const files = parentSha ? getCommitFiles(repo, parentSha) : new Map<string, { mode: string; sha: string }>();
       const existing = files.get(filePath);
       if (!existing) {
-        sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+        sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
         return true;
       }
       if (!providedSha || providedSha !== existing.sha) {
@@ -500,17 +750,7 @@ export function handleRest(
         return true;
       }
       files.delete(filePath);
-      const treeSha = buildTreeFromFiles(repo, files);
-      const ts = store.nextTimestamp();
-      const commitSha = createCommit(
-        repo,
-        treeSha,
-        parentSha ? [parentSha] : [],
-        message,
-        store.getViewerLogin(),
-        ts.epoch,
-      );
-      repo.refs.set(refName, commitSha);
+      const commitSha = commitTreeChange(store, repo, refName, parentSha, files, message);
       sendJson(res, 200, { content: null, commit: { sha: commitSha, message } }, baseHeaders);
       return true;
     }
@@ -534,6 +774,7 @@ export function handleRest(
         description: typeof bodyObj.description === 'string' ? bodyObj.description : '',
       };
       repo.labels.set(name, label);
+      store.mutationEpoch += 1;
       sendJson(res, 201, label, baseHeaders);
       return true;
     }
@@ -543,14 +784,13 @@ export function handleRest(
   if (sub === 'issues') {
     if (method === 'GET') {
       const state = url.searchParams.get('state') ?? 'open';
-      const sort = url.searchParams.get('sort') ?? 'created';
       const direction = url.searchParams.get('direction') ?? 'desc';
       const perPage = Math.max(1, Math.min(100, parseInt(url.searchParams.get('per_page') ?? '30', 10) || 30));
       const page = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10) || 1);
 
       let list = repo.issues.filter((i) => state === 'all' || i.state === state);
       list = [...list].sort((a, b) => {
-        const cmp = sort === 'created' ? a.number - b.number : a.number - b.number;
+        const cmp = a.number - b.number;
         return direction === 'asc' ? cmp : -cmp;
       });
       const start = (page - 1) * perPage;
@@ -584,16 +824,12 @@ export function handleRest(
         created_at: ts.iso,
         updated_at: ts.iso,
         closed_at: null,
+        cachedHttpBuf: null,
       };
       repo.issues.push(issue);
       repo.issueByNumber.set(issue.number, issue);
-      const jsonBuf = getIssueJsonBuf(issue);
-      res.writeHead(201, {
-        'content-type': JSON_TYPE,
-        'content-length': jsonBuf.length,
-        ...baseHeaders,
-      });
-      res.end(jsonBuf);
+      store.mutationEpoch += 1;
+      sendRawBuf(res, 201, getIssueJsonBuf(issue), baseHeaders);
       return true;
     }
   }
@@ -604,17 +840,11 @@ export function handleRest(
     const num = parseInt(issueMatch[1]!, 10);
     const issue = repo.issueByNumber.get(num);
     if (!issue) {
-      sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+      sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
       return true;
     }
     if (method === 'GET') {
-      const jsonBuf = getIssueJsonBuf(issue);
-      res.writeHead(200, {
-        'content-type': JSON_TYPE,
-        'content-length': jsonBuf.length,
-        ...baseHeaders,
-      });
-      res.end(jsonBuf);
+      sendRawBuf(res, 200, getIssueJsonBuf(issue), baseHeaders);
       return true;
     }
     if (method === 'PATCH') {
@@ -625,8 +855,8 @@ export function handleRest(
         issue.closed_at = bodyObj.state === 'closed' ? store.nextTimestamp().iso : null;
       }
       issue.updated_at = store.nextTimestamp().iso;
-      issue.cachedJsonBuf = undefined;
-      sendJson(res, 200, formatIssue(issue), baseHeaders);
+      invalidateIssueCache(store, issue);
+      sendRawBuf(res, 200, getIssueJsonBuf(issue), baseHeaders);
       return true;
     }
   }
@@ -637,7 +867,7 @@ export function handleRest(
     const num = parseInt(commentMatch[1]!, 10);
     const issue = repo.issueByNumber.get(num);
     if (!issue) {
-      sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+      sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
       return true;
     }
     if (method === 'GET') {
@@ -655,7 +885,7 @@ export function handleRest(
         updated_at: ts.iso,
       };
       issue.comments.push(comment);
-      issue.cachedJsonBuf = undefined;
+      invalidateIssueCache(store, issue);
       sendJson(res, 201, comment, baseHeaders);
       return true;
     }
@@ -702,6 +932,7 @@ export function handleRest(
         updated_at: ts.iso,
       };
       repo.pulls.push(pr);
+      store.mutationEpoch += 1;
       sendJson(res, 201, formatPull(pr), baseHeaders);
       return true;
     }
@@ -713,7 +944,7 @@ export function handleRest(
     const num = parseInt(pullMatch[1]!, 10);
     const pr = repo.pulls.find((p) => p.number === num);
     if (!pr) {
-      sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+      sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
       return true;
     }
     if (method === 'GET') {
@@ -728,7 +959,7 @@ export function handleRest(
     const num = parseInt(pullFilesMatch[1]!, 10);
     const pr = repo.pulls.find((p) => p.number === num);
     if (!pr) {
-      sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+      sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
       return true;
     }
     const baseSha = repo.refs.get(`refs/heads/${pr.baseRef}`) ?? pr.baseSha;
@@ -743,7 +974,7 @@ export function handleRest(
     const num = parseInt(pullMergeMatch[1]!, 10);
     const pr = repo.pulls.find((p) => p.number === num);
     if (!pr) {
-      sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+      sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
       return true;
     }
     const result = mergePullRequest(store, repo, pr);
@@ -755,6 +986,6 @@ export function handleRest(
     return true;
   }
 
-  sendJson(res, 404, { message: 'Not Found' }, baseHeaders);
+  sendRawBuf(res, 404, ERR_NOT_FOUND_BUF, baseHeaders);
   return true;
 }

@@ -1,7 +1,7 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import { computePullFiles, mergePullRequest, sendJson } from './rest.ts';
+import { computePullFiles, mergePullRequest, sendJson, sendRawBuf, type HttpRequest, type HttpResponse } from './rest.ts';
 import {
   ForgeStore,
+  invalidateIssueCache,
   resolveRefOrSha,
   type Issue,
   type PullRequest,
@@ -10,6 +10,17 @@ import {
 
 // ---------------------------------------------------------------------------
 // Minimal GraphQL AST & Parser
+
+interface VarRef {
+  readonly __varRef: true;
+  readonly name: string;
+}
+
+const ERR_AUTH_BUF = Buffer.from('{"message":"Requires authentication"}', 'ascii');
+const ERR_METHOD_BUF = Buffer.from('{"message":"Method Not Allowed"}', 'ascii');
+const ERR_PARSE_BUF = Buffer.from('{"message":"Problems parsing JSON"}', 'ascii');
+const ERR_INVALID_GQL_BUF = Buffer.from('{"message":"Invalid GraphQL request"}', 'ascii');
+const NO_OP_RESPONSE_BUF = Buffer.from('{"data":null,"errors":[{"message":"No operation found"}]}', 'ascii');
 
 interface SelectionField {
   kind: 'field';
@@ -118,11 +129,9 @@ function tokenize(src: string): Token[] {
 class Parser {
   private pos = 0;
   private readonly tokens: Token[];
-  private readonly vars: Record<string, unknown>;
 
-  constructor(tokens: Token[], vars: Record<string, unknown>) {
+  constructor(tokens: Token[]) {
     this.tokens = tokens;
-    this.vars = vars;
   }
 
   private peek(): Token | undefined {
@@ -243,7 +252,7 @@ class Parser {
     if (!t) return null;
     if (this.eat('$')) {
       const varName = this.next()?.val ?? '';
-      return this.vars[varName];
+      return { __varRef: true, name: varName } satisfies VarRef;
     }
     if (this.eat('[')) {
       const arr: unknown[] = [];
@@ -294,6 +303,63 @@ const ENUM_VALUES: Record<string, string[]> = {
   MergeableState: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'],
 };
 
+interface IntrospectionNode {
+  name: string;
+  fields: Array<{ name: string }>;
+  enumValues: Array<{ name: string }>;
+}
+
+const INTROSPECTION_CACHE = new Map<string, IntrospectionNode>();
+for (const [typeName, fieldList] of Object.entries(TYPE_FIELDS)) {
+  INTROSPECTION_CACHE.set(typeName, {
+    name: typeName,
+    fields: fieldList.map((n) => ({ name: n })),
+    enumValues: (ENUM_VALUES[typeName] ?? []).map((n) => ({ name: n })),
+  });
+}
+
+function isVarRef(val: unknown): val is VarRef {
+  return typeof val === 'object' && val !== null && (val as Partial<VarRef>).__varRef === true;
+}
+
+function resolveVarValue(val: unknown, vars: Record<string, unknown>): unknown {
+  if (isVarRef(val)) return vars[val.name];
+  if (Array.isArray(val)) {
+    let changed = false;
+    const out = new Array<unknown>(val.length);
+    for (let i = 0; i < val.length; i += 1) {
+      const item = val[i];
+      const resolved = resolveVarValue(item, vars);
+      if (resolved !== item) changed = true;
+      out[i] = resolved;
+    }
+    return changed ? out : val;
+  }
+  if (typeof val === 'object' && val !== null) {
+    const rec = val as Record<string, unknown>;
+    let changed = false;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rec)) {
+      const resolved = resolveVarValue(v, vars);
+      if (resolved !== v) changed = true;
+      out[k] = resolved;
+    }
+    return changed ? out : val;
+  }
+  return val;
+}
+
+function resolveArgs(rawArgs: Record<string, unknown>, vars: Record<string, unknown>): Record<string, unknown> {
+  const keys = Object.keys(rawArgs);
+  if (keys.length === 0) return rawArgs;
+  const out: Record<string, unknown> = {};
+  for (let i = 0; i < keys.length; i += 1) {
+    const k = keys[i]!;
+    out[k] = resolveVarValue(rawArgs[k], vars);
+  }
+  return out;
+}
+
 function expandSelections(selections: Selection[], frags: Map<string, FragmentDef>): SelectionField[] {
   const out: SelectionField[] = [];
   for (const s of selections) {
@@ -323,6 +389,7 @@ function resolveObj(
   obj: Record<string, unknown> | null,
   selections: Selection[],
   frags: Map<string, FragmentDef>,
+  vars: Record<string, unknown>,
   errors: Array<{ message: string }>,
   typeName?: string,
 ): Record<string, unknown> | null {
@@ -341,16 +408,16 @@ function resolveObj(
     }
     const val = obj[f.name];
     if (typeof val === 'function') {
-      const res = (val as (args: Record<string, unknown>) => unknown)(f.args);
+      const res = (val as (args: Record<string, unknown>) => unknown)(resolveArgs(f.args, vars));
       if (f.selections.length > 0 && res !== null && typeof res === 'object') {
         if (Array.isArray(res)) {
           out[key] = res.map((item) =>
             item !== null && typeof item === 'object'
-              ? resolveObj(item as Record<string, unknown>, f.selections, frags, errors)
+              ? resolveObj(item as Record<string, unknown>, f.selections, frags, vars, errors)
               : item,
           );
         } else {
-          out[key] = resolveObj(res as Record<string, unknown>, f.selections, frags, errors);
+          out[key] = resolveObj(res as Record<string, unknown>, f.selections, frags, vars, errors);
         }
       } else {
         out[key] = res;
@@ -359,11 +426,11 @@ function resolveObj(
       if (Array.isArray(val)) {
         out[key] = val.map((item) =>
           item !== null && typeof item === 'object'
-            ? resolveObj(item as Record<string, unknown>, f.selections, frags, errors)
+            ? resolveObj(item as Record<string, unknown>, f.selections, frags, vars, errors)
             : item,
         );
       } else {
-        out[key] = resolveObj(val as Record<string, unknown>, f.selections, frags, errors);
+        out[key] = resolveObj(val as Record<string, unknown>, f.selections, frags, vars, errors);
       }
     } else {
       out[key] = val;
@@ -397,12 +464,6 @@ function makeIssueNode(store: ForgeStore, repo: Repository, issue: Issue): Recor
 function makePullNode(store: ForgeStore, repo: Repository, pr: PullRequest): Record<string, unknown> {
   const baseSha = repo.refs.get(`refs/heads/${pr.baseRef}`) ?? pr.baseSha;
   const headSha = repo.refs.get(`refs/heads/${pr.headRef}`) ?? pr.headSha;
-  const files = computePullFiles(repo, baseSha, headSha).map((f) => ({
-    path: f.filename,
-    additions: f.additions,
-    deletions: f.deletions,
-    changeType: f.status.toUpperCase(),
-  }));
 
   return {
     __typename: 'PullRequest',
@@ -425,6 +486,12 @@ function makePullNode(store: ForgeStore, repo: Repository, pr: PullRequest): Rec
     updatedAt: pr.updated_at,
     author: { __typename: 'User', login: pr.user.login },
     files: (args: Record<string, unknown>) => {
+      const files = computePullFiles(repo, baseSha, headSha).map((f) => ({
+        path: f.filename,
+        additions: f.additions,
+        deletions: f.deletions,
+        changeType: f.status.toUpperCase(),
+      }));
       const first = typeof args.first === 'number' ? args.first : files.length;
       const sliced = files.slice(0, first);
       return {
@@ -458,7 +525,7 @@ function makeRepoNode(store: ForgeStore, repo: Repository): Record<string, unkno
     description: repo.description,
     issue: (args: Record<string, unknown>) => {
       const num = typeof args.number === 'number' ? args.number : Number(args.number);
-      const found = repo.issues.find((i) => i.number === num);
+      const found = repo.issueByNumber.get(num);
       return found ? makeIssueNode(store, repo, found) : null;
     },
     issues: (args: Record<string, unknown>) => {
@@ -519,6 +586,7 @@ function executeOperation(
   store: ForgeStore,
   op: OperationDef,
   frags: Map<string, FragmentDef>,
+  vars: Record<string, unknown>,
 ): { data: Record<string, unknown> | null; errors?: Array<{ message: string }> } {
   const errors: Array<{ message: string }> = [];
 
@@ -526,10 +594,7 @@ function executeOperation(
     viewer: { __typename: 'User', id: 'U_1', login: store.getViewerLogin() },
     __type: (args: Record<string, unknown>) => {
       const typeName = String(args.name ?? '');
-      if (!(typeName in TYPE_FIELDS)) return null;
-      const fields = (TYPE_FIELDS[typeName] ?? []).map((n) => ({ name: n }));
-      const enumVals = (ENUM_VALUES[typeName] ?? []).map((n) => ({ name: n }));
-      return { name: typeName, fields, enumValues: enumVals };
+      return INTROSPECTION_CACHE.get(typeName) ?? null;
     },
     repository: (args: Record<string, unknown>) => {
       const owner = String(args.owner ?? '');
@@ -549,7 +614,7 @@ function executeOperation(
         const repoName = id.slice(2, last);
         const num = parseInt(id.slice(last + 1), 10);
         const repo = store.repos.get(repoName);
-        const issue = repo?.issues.find((i) => i.number === num);
+        const issue = repo?.issueByNumber.get(num);
         return repo && issue ? makeIssueNode(store, repo, issue) : null;
       }
       if (id.startsWith('PR_')) {
@@ -598,6 +663,7 @@ function executeOperation(
       };
       repo.issues.push(issue);
       repo.issueByNumber.set(issue.number, issue);
+      store.mutationEpoch += 1;
       return { issue: makeIssueNode(store, repo, issue) };
     },
     closeIssue: (args: Record<string, unknown>) => {
@@ -615,7 +681,7 @@ function executeOperation(
       issue.state = 'closed';
       issue.closed_at = store.nextTimestamp().iso;
       issue.updated_at = issue.closed_at;
-      issue.cachedJsonBuf = undefined;
+      invalidateIssueCache(store, issue);
       return { issue: makeIssueNode(store, repo, issue) };
     },
     createPullRequest: (args: Record<string, unknown>) => {
@@ -654,6 +720,7 @@ function executeOperation(
         updated_at: ts.iso,
       };
       repo.pulls.push(pr);
+      store.mutationEpoch += 1;
       return { pullRequest: makePullNode(store, repo, pr) };
     },
     mergePullRequest: (args: Record<string, unknown>) => {
@@ -696,27 +763,40 @@ function executeOperation(
         updated_at: ts.iso,
       };
       issue.comments.push(comment);
-      issue.cachedJsonBuf = undefined;
+      invalidateIssueCache(store, issue);
       return { commentEdge: { node: { id: `C_${comment.id}`, body: comment.body } } };
     },
   };
 
   const root = op.opType === 'mutation' ? rootMutation : rootQuery;
-  const data = resolveObj(root, op.selections, frags, errors, op.opType === 'mutation' ? 'Mutation' : 'Query');
+  const data = resolveObj(root, op.selections, frags, vars, errors, op.opType === 'mutation' ? 'Mutation' : 'Query');
   return errors.length > 0 ? { data: null, errors } : { data };
 }
 
+const DOC_CACHE = new Map<string, { ops: OperationDef[]; frags: Map<string, FragmentDef> }>();
+
+function parseCachedDoc(query: string): { ops: OperationDef[]; frags: Map<string, FragmentDef> } {
+  let doc = DOC_CACHE.get(query);
+  if (doc === undefined) {
+    doc = new Parser(tokenize(query)).parseDocument();
+    if (DOC_CACHE.size < 256) {
+      DOC_CACHE.set(query, doc);
+    }
+  }
+  return doc;
+}
+
 function runOneDoc(store: ForgeStore, query: string, variables: Record<string, unknown>): Record<string, unknown> {
-  const { ops, frags } = new Parser(tokenize(query), variables).parseDocument();
+  const { ops, frags } = parseCachedDoc(query);
   if (ops.length === 0) {
     return { data: null, errors: [{ message: 'No operation found' }] };
   }
-  return executeOperation(store, ops[0]!, frags);
+  return executeOperation(store, ops[0]!, frags, variables);
 }
 
 export function handleGraphql(
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: HttpRequest,
+  res: HttpResponse,
   store: ForgeStore,
   url: URL,
   rawBody: Buffer,
@@ -725,13 +805,14 @@ export function handleGraphql(
   if (url.pathname !== '/api/graphql') return false;
 
   const baseHeaders = { 'x-github-request-id': reqId };
-  if (!store.isAuthorized(req.headers.authorization)) {
-    sendJson(res, 401, { message: 'Requires authentication' }, baseHeaders);
+  const authHeader = Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : req.headers.authorization;
+  if (!store.isAuthorized(authHeader)) {
+    sendRawBuf(res, 401, ERR_AUTH_BUF, baseHeaders);
     return true;
   }
 
   if (req.method !== 'POST') {
-    sendJson(res, 405, { message: 'Method Not Allowed' }, baseHeaders);
+    sendRawBuf(res, 405, ERR_METHOD_BUF, baseHeaders);
     return true;
   }
 
@@ -739,7 +820,7 @@ export function handleGraphql(
   try {
     parsed = JSON.parse(rawBody.toString('utf8'));
   } catch {
-    sendJson(res, 400, { message: 'Problems parsing JSON' }, baseHeaders);
+    sendRawBuf(res, 400, ERR_PARSE_BUF, baseHeaders);
     return true;
   }
 
@@ -755,12 +836,16 @@ export function handleGraphql(
   }
 
   if (typeof parsed !== 'object' || parsed === null) {
-    sendJson(res, 400, { message: 'Invalid GraphQL request' }, baseHeaders);
+    sendRawBuf(res, 400, ERR_INVALID_GQL_BUF, baseHeaders);
     return true;
   }
 
   const obj = parsed as Record<string, unknown>;
   const q = typeof obj.query === 'string' ? obj.query : '';
+  if (q === '') {
+    sendRawBuf(res, 200, NO_OP_RESPONSE_BUF, baseHeaders);
+    return true;
+  }
   const v = typeof obj.variables === 'object' && obj.variables !== null ? (obj.variables as Record<string, unknown>) : {};
   sendJson(res, 200, runOneDoc(store, q, v), baseHeaders);
   return true;
